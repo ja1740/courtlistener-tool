@@ -1,0 +1,18 @@
+# Folders created at runtime — do not commit these
+pdfs/
+snapshots/
+reports/
+
+# Local database created when indexing PDFs
+search_index.db
+
+# Your actual API key — never commit this
+.env
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Mac system files
+.DS_Store
