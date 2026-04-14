@@ -1,154 +1,150 @@
-# WHAT THIS FILE DOES:
-# Builds the markdown report that summarizes each run.
-# It takes the list of cases found, any changes detected, and
-# any download errors, and writes them into a readable .md file.
-#
-# WHY IT EXISTS:
-# A lawyer running this tool weekly needs a clean, readable summary
-# they can open and scan immediately. This file produces that output.
-#
-# HOW IT FITS INTO THE PROJECT:
-# main.py calls write_report() after fetcher.py and differ.py have
-# finished. The report is saved to the reports/ folder.
-
 import os
+import json
+import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+_EASTERN = ZoneInfo("America/New_York")
+
+logger = logging.getLogger(__name__)
 
 
-def format_case_table(results):
-    """
-    Creates a markdown table listing every case that was retrieved.
-    Takes the list of case records from fetcher.py.
-    Returns a multi-line string containing the formatted markdown table.
-    """
-    # Table header row
-    table_lines = [
-        "| Case Name | Citation | Court | Date Filed | Docket No. | Documents | PDF Status |",
-        "|-----------|----------|-------|------------|------------|-----------|------------|",
+def _case_key(case):
+    """Stable dedup key: prefer docket number, fall back to case_name|court."""
+    docket = (case.get("docket_number") or "").strip()
+    if docket and docket != "N/A":
+        return docket
+    return f"{case.get('case_name', '')}|{case.get('court', '')}"
+
+
+def load_master(master_path):
+    if not os.path.exists(master_path):
+        return {}
+    with open(master_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def merge_into_master(master, new_results):
+    """Add cases not already in master. Returns list of newly added cases."""
+    added = []
+    for case in new_results:
+        key = _case_key(case)
+        if key not in master:
+            master[key] = {
+                "case_name":     case.get("case_name", "Unknown"),
+                "citation":      case.get("citation", "N/A"),
+                "court":         case.get("court", "Unknown"),
+                "date_filed":    case.get("date_filed", "Unknown"),
+                "docket_number": case.get("docket_number", "N/A"),
+            }
+            added.append(master[key])
+        else:
+            existing = master[key]
+            if (not existing.get("citation") or existing["citation"] == "N/A") \
+                    and case.get("citation") and case["citation"] != "N/A":
+                existing["citation"] = case["citation"]
+    return added
+
+
+def save_master(master, master_path):
+    with open(master_path, "w", encoding="utf-8") as f:
+        json.dump(master, f, indent=2)
+    logger.info(f"Master list saved: {len(master)} unique case(s).")
+
+
+def format_case_table(cases):
+    sorted_cases = sorted(cases, key=lambda c: c.get("date_filed", ""), reverse=True)
+    lines = [
+        "| Case Name | Citation | Court | Date Filed | Docket No. |",
+        "|-----------|----------|-------|------------|------------|",
     ]
-
-    # Add one row per case
-    for case in results:
-        # Count how many documents are in this cluster
-        doc_count = len(case.get("doc_count", []))
-
-        # Truncate long case names so the table stays readable
-        case_name = case.get("case_name", "Unknown")[:60]
-
-        row = (
-            f"| {case_name} "
-            f"| {case.get(\'citation\', \'N/A\')} "
-            f"| {case.get(\'court\', \'Unknown\')} "
-            f"| {case.get(\'date_filed\', \'Unknown\')} "
-            f"| {case.get(\'docket_number\', \'N/A\')} "
-            f"| {doc_count} "
-            f"| {case.get(\'pdf_status\', \'Unknown\')} |"
+    for case in sorted_cases:
+        name = (case.get("case_name") or "Unknown")[:60]
+        lines.append(
+            f"| {name} "
+            f"| {case.get('citation', 'N/A')} "
+            f"| {case.get('court', 'Unknown')} "
+            f"| {case.get('date_filed', 'Unknown')} "
+            f"| {case.get('docket_number', 'N/A')} |"
         )
-        table_lines.append(row)
-
-    return "\n".join(table_lines)
+    return "\n".join(lines)
 
 
-def format_changes_section(changes):
-    """
-    Creates the \'Changes Since Last Run\' section of the report.
-    Takes the changes dictionary produced by differ.py.
-    Returns a formatted markdown string listing new, dropped, and updated cases.
-    """
-    # If this is the first run, there is nothing to compare
-    if changes is None:
-        return "## Changes Since Last Run\n\nThis is the first run. No prior results to compare.\n"
-
-    new_cases = changes.get("new", [])
-    dropped_cases = changes.get("dropped", [])
-    updated_cases = changes.get("updated", [])
-
-    lines = ["## Changes Since Last Run\n"]
-
-    # List new cases
-    lines.append(f"### New Cases ({len(new_cases)})")
-    if new_cases:
-        for case in new_cases:
-            lines.append(f"- {case.get(\'case_name\', \'Unknown\')} ({case.get(\'date_filed\', \'Unknown\')})")
-    else:
-        lines.append("- None")
-
-    lines.append("")
-
-    # List dropped cases
-    lines.append(f"### Dropped Cases ({len(dropped_cases)})")
-    if dropped_cases:
-        for case in dropped_cases:
-            lines.append(f"- {case.get(\'case_name\', \'Unknown\')} ({case.get(\'date_filed\', \'Unknown\')})")
-    else:
-        lines.append("- None")
-
-    lines.append("")
-
-    # List updated cases
-    lines.append(f"### Updated Cases ({len(updated_cases)})")
-    if updated_cases:
-        for case in updated_cases:
-            lines.append(f"- {case.get(\'case_name\', \'Unknown\')} — {case.get(\'change_note\', \'fields changed\')}")
-    else:
-        lines.append("- None")
-
+def format_new_cases_section(added):
+    if not added:
+        return "## New Cases This Run\n\nNone.\n"
+    lines = [f"## New Cases This Run ({len(added)})\n"]
+    for c in sorted(added, key=lambda x: x.get("date_filed", ""), reverse=True):
+        lines.append(
+            f"- **{c.get('case_name', 'Unknown')}** — "
+            f"{c.get('court', '')} ({c.get('date_filed', '')})"
+        )
     return "\n".join(lines)
 
 
 def format_errors_section(errors):
-    """
-    Creates a section listing any PDFs that failed to download.
-    Takes the list of error records from fetcher.py.
-    Returns a formatted markdown string.
-    """
     if not errors:
-        return "## Download Errors\n\nNo errors.\n"
-
-    lines = [f"## Download Errors ({len(errors)} total)\n"]
-    for error_record in errors:
-        lines.append(f"- **{error_record.get(\'case_name\', \'Unknown\')}** ({error_record.get(\'cluster_id\', \'\')}): {error_record.get(\'error\', \'Unknown error\')}")
-
+        return "## Download Errors\n\nNone.\n"
+    seen, deduped = set(), []
+    for e in errors:
+        name = e.get("case_name", "Unknown")
+        if name not in seen:
+            seen.add(name)
+            deduped.append(e)
+    lines = [f"## Download Errors ({len(deduped)} case(s) affected)\n"]
+    for e in deduped:
+        raw = e.get("error", "?")
+        if "404" in raw:
+            reason = "404 — document not publicly available (may require court login)"
+        elif "403" in raw:
+            reason = "403 — court website blocked automated access"
+        elif "SSL" in raw or "certificate" in raw.lower():
+            reason = "SSL error — certificate issue with court's server"
+        else:
+            reason = raw[:120]
+        lines.append(f"- **{e.get('case_name', 'Unknown')}**: {reason}")
     return "\n".join(lines)
 
 
-def write_report(results, changes, params, errors, reports_dir):
-    """
-    The main function called by main.py.
-    Assembles all sections into a single markdown file and saves it.
-    Takes the results, changes, search params, errors, and output folder.
-    """
-    # --- Step 1: Create the reports/ folder if it does not exist ---
+def cleanup_reports(reports_dir, keep=30):
+    """Keep only the most recent `keep` report files; delete the rest."""
+    if not os.path.exists(reports_dir):
+        return
+    reports = sorted(
+        f for f in os.listdir(reports_dir)
+        if f.startswith("report_") and f.endswith(".md")
+    )
+    to_delete = reports[:-keep] if len(reports) > keep else []
+    for filename in to_delete:
+        os.remove(os.path.join(reports_dir, filename))
+    if to_delete:
+        logger.info(f"Removed {len(to_delete)} old report(s).")
+
+
+def write_report(master, added, query, filed_after, max_results, court, errors, reports_dir):
     os.makedirs(reports_dir, exist_ok=True)
-
-    # --- Step 2: Build the report filename using today\'s date ---
-    today = datetime.now().strftime("%Y-%m-%d")
-    run_time = datetime.now().strftime("%Y-%m-%d at %H:%M:%S")
-    report_filename = f"report_{today}.md"
-    report_path = os.path.join(reports_dir, report_filename)
-
-    # --- Step 3: Build each section of the report ---
+    now      = datetime.now(tz=_EASTERN)
+    run_time = now.strftime("%Y-%m-%d at %I:%M %p ET")
+    today    = now.strftime("%Y-%m-%d")
+    path     = os.path.join(reports_dir, f"report_{today}.md")
     header = f"""# CourtListener AI Copyright Case Tracker
 ## Run Report — {run_time}
 
 ## Search Parameters
-- **Query:** {params.get(\'query\', \'N/A\')[:200]}
-- **Filed After:** {params.get(\'filed_after\', \'N/A\')}
-- **Max Results:** {params.get(\'max_results\', \'N/A\')}
-- **Court Filter:** {params.get(\'court\') or \'None (all courts)\'}
-- **Total Cases Retrieved:** {len(results)}
-- **Download Errors:** {len(errors)}
+- **Query:** {query[:200]}
+- **Filed After:** {filed_after}
+- **Max Results per Run:** {max_results}
+- **Court Filter:** {court or 'None (all courts)'}
+- **Total Unique Cases on Record:** {len(master)}
+- **Added This Run:** {len(added)}
 """
-
-    case_table = f"## Cases Retrieved\n\n{format_case_table(results)}\n"
-    changes_section = format_changes_section(changes)
-    errors_section = format_errors_section(errors)
-
-    # --- Step 4: Combine all sections into the final report ---
-    full_report = "\n".join([header, case_table, changes_section, errors_section])
-
-    # --- Step 5: Write the report file to disk ---
-    with open(report_path, "w", encoding="utf-8") as report_file:
-        report_file.write(full_report)
-
-    print(f"Report saved to: {report_path}")
+    full_report = "\n".join([
+        header,
+        f"## All Cases\n\n{format_case_table(list(master.values()))}\n",
+        format_new_cases_section(added),
+        format_errors_section(errors),
+    ])
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(full_report)
+    logger.info(f"Report saved to: {path}")
+    return path
